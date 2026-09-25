@@ -36,12 +36,17 @@
                 :http-headers
                 :http-major-version
                 :http-minor-version
+                :http-content-length
                 :parsing-error
                 :fast-http-error)
   (:import-from :smart-buffer
                 :make-smart-buffer
                 :write-to-buffer
-                :finalize-buffer)
+                :finalize-buffer
+                :buffer-on-memory-p
+                :delete-stream-file
+                :buffer-limit-exceeded
+                :*default-disk-limit*)
   (:import-from :trivial-utf-8
                 :string-to-utf-8-bytes
                 :utf-8-bytes-to-string
@@ -153,19 +158,31 @@
           (start-multithread-server)
           (start-singlethread-server)))))
 
+(defun respond-and-close (socket status message)
+  (setf (wev:socket-data socket)
+        (lambda (data &key start end)
+          (declare (ignore data start end))))
+  (let ((body (string-to-utf-8-bytes message)))
+    (wev:with-async-writing (socket :write-cb #'wev:close-socket)
+      (write-response-headers socket status
+                              (list :connection "close"
+                                    :content-length (length body)))
+      (wev:write-socket-data socket body))))
+
 (defun read-cb (socket data &key (start 0) (end (length data)))
   (let ((parser (wev:socket-data socket)))
-    (handler-case (funcall parser data :start start :end end)
-      (fast-http:parsing-error (e)
-        (vom:error "HTTP parse error: ~A" e)
-        (let ((body #.(map '(simple-array (unsigned-byte 8) (*))
-                           #'char-code
-                           "400 Bad Request")))
-          (wev:with-async-writing (socket :write-cb #'wev:close-socket)
-            (write-response-headers socket 400
-                                    (list :connection "close"
-                                          :content-length (length body)))
-            (wev:write-socket-data socket body)))))))
+    (block nil
+      (handler-bind (((or fast-http:cb-headers-complete fast-http:cb-body)
+                       (lambda (e)
+                         (let ((cause (slot-value e 'error)))
+                           (when (typep cause 'buffer-limit-exceeded)
+                             (vom:error "~A" cause)
+                             (respond-and-close socket 413 "413 Request Entity Too Large")
+                             (return))))))
+        (handler-case (funcall parser data :start start :end end)
+          (fast-http:parsing-error (e)
+            (vom:error "HTTP parse error: ~A" e)
+            (respond-and-close socket 400 "400 Bad Request")))))))
 
 (define-condition woo-error (simple-error) ())
 (define-condition invalid-http-version (woo-error) ())
@@ -186,28 +203,44 @@
 (defun setup-parser (socket)
   (let ((http (make-http-request))
         (body-buffer (make-smart-buffer)))
+    (setf (wev:socket-close-cb socket)
+          (lambda (socket)
+            (declare (ignore socket))
+            (unless (buffer-on-memory-p body-buffer)
+              (ignore-errors
+               (with-open-stream (raw-body (finalize-buffer body-buffer))
+                 (delete-stream-file raw-body))))))
     (setf (wev:socket-data socket)
           (make-parser http
+                       :header-callback
+                       (lambda (headers)
+                         (declare (ignore headers))
+                         (let ((content-length (http-content-length http)))
+                           (when (and content-length (< *default-disk-limit* content-length))
+                             (error 'buffer-limit-exceeded :limit *default-disk-limit*))))
                        :body-callback
                        (lambda (data start end)
                          (declare (type (simple-array (unsigned-byte 8) (*)) data))
-                         (if (smart-buffer::buffer-on-memory-p body-buffer)
+                         (if (buffer-on-memory-p body-buffer)
                              (write-to-buffer body-buffer (subseq data start end) 0 (- end start))
                              (write-to-buffer body-buffer data start end)))
                        :finish-callback
-                       (flet ((main (env)
-                                (handle-response http socket
-                                                 (if *debug*
-                                                     (funcall *app* env)
-                                                     (if-let (res (handler-case (funcall *app* env)
-                                                                    (error (error)
-                                                                      (vom:error (princ-to-string error))
-                                                                      nil)))
-                                                             res
-                                                             '(500 nil nil))))))
+                       (flet ((main (env raw-body)
+                                (let ((res (if *debug*
+                                               (funcall *app* env)
+                                               (if-let (res (handler-case (funcall *app* env)
+                                                              (error (error)
+                                                                (vom:error (princ-to-string error))
+                                                                nil)))
+                                                 res
+                                                 '(500 nil nil)))))
+                                  (prog1 (handle-response http socket res)
+                                    (when (listp res)
+                                      (close raw-body))))))
                          (lambda ()
                            (block result
                              (let ((raw-body (finalize-buffer body-buffer)))
+                               (delete-stream-file raw-body)
                                (setq body-buffer (make-smart-buffer))
                                (handler-bind
                                    ((error ;; handle errors inside woo
@@ -217,7 +250,7 @@
                                           (return-from result (handle-response http socket '(500 nil nil)))))))
                                  (let ((env (nconc (list :raw-body raw-body)
                                                    (handle-request http socket))))
-                                   (main env)))))))))))
+                                   (main env raw-body)))))))))))
 
 (defun stop (server)
   (wev:close-tcp-server server))
